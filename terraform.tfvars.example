@@ -1,0 +1,32 @@
+# Copy this file to terraform.tfvars and fill in your values
+# DO NOT commit terraform.tfvars to version control as it contains sensitive information
+
+# Hetzner Cloud API token (required)
+hcloud_token = "your_hetzner_cloud_api_token"
+
+# Server location (optional, defaults to hel1)
+server_location = "hel1"
+
+# Path to your SSH private key (optional, defaults to ~/.ssh/id_rsa)
+ssh_private_key_path = "~/.ssh/id_rsa"
+
+# Database configuration (customize as needed)
+db_user     = "fisioapp"
+db_password = "strong_password_here"
+db_name     = "fisioapp"
+
+# Docker image configuration (customize as needed)
+docker_image_repo = "franarnaudo/fisio-app"
+frontend_image_tag = "frontend-latest"
+backend_image_tag = "backend-latest"
+docker_username = "franarnaudo"
+docker_password = ""
+
+# JWT secret for authentication (required)
+jwt_secret = "your_jwt_secret_here"
+
+# Deployment version - change this to trigger a redeployment
+deployment_version = "1.0.0"
+
+# Number of database backups to keep
+backups_to_keep = 7

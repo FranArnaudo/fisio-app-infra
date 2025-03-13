@@ -13,40 +13,28 @@ provider "hcloud" {
   token = var.hcloud_token
 }
 
-# Create a new SSH key
-resource "hcloud_ssh_key" "default" {
-  name       = "FisioApp Deployment Key"
-  public_key = file("~/.ssh/id_rsa.pub")
+# Data source for existing SSH key - use this instead of creating a new one
+data "hcloud_ssh_key" "existing" {
+  name = "FisioApp Deployment Key"
 }
 
-# Create a server
+# Server configuration
 resource "hcloud_server" "app_server" {
   name        = "fisioapp-server"
   image       = "ubuntu-20.04"
-  server_type = "cx21"  # 4GB RAM, 2 vCPU - adjust as needed
+  server_type = "cx22"  # 4GB RAM, 2 vCPU
   location    = var.server_location
-  ssh_keys    = [hcloud_ssh_key.default.id]
+  ssh_keys    = [data.hcloud_ssh_key.existing.id]
   
-  # Ensure firewall allows needed ports
+  # Reference existing firewall
   firewall_ids = [hcloud_firewall.app_firewall.id]
 
-  # Additional volume for database persistence
-  connection {
-    type        = "ssh"
-    user        = "root"
-    private_key = file("~/.ssh/id_rsa")
-    host        = self.ipv4_address
-  }
-
-  # Initial server setup
-  provisioner "remote-exec" {
-    inline = [
-      "apt update",
-      "apt install -y docker.io docker-compose",
-      "systemctl enable docker",
-      "systemctl start docker",
-      "mkdir -p /app/data",
-      "docker volume create postgres_data"
+  # Keep the server resource to a minimum
+  # We don't want to modify the server itself during redeployments
+  lifecycle {
+    ignore_changes = [
+      image,
+      ssh_keys
     ]
   }
 }
@@ -88,9 +76,39 @@ resource "hcloud_firewall" "app_firewall" {
   }
 }
 
-# Create the docker-compose.yml file
-resource "null_resource" "docker_compose" {
+# Deployment resource - this will run every time you apply
+# because of the triggers configuration
+resource "null_resource" "deployment" {
   depends_on = [hcloud_server.app_server]
+
+  # This will trigger a redeployment every time you run terraform apply
+  # with a different deployment_version
+  triggers = {
+    deployment_version = var.deployment_version
+  }
+
+  # Initial server setup - will only run on first deploy
+  provisioner "remote-exec" {
+  inline = [
+    "if [ ! -d /app ]; then",
+    "  apt update",
+    "  apt install -y docker.io docker-compose",
+    "  systemctl enable docker",
+    "  systemctl start docker",
+    "  mkdir -p /app/data",
+    "  docker volume create postgres_data || true",
+    "fi",
+    "# Always perform Docker login - outside the conditional",
+    "echo ${var.docker_password} | docker login -u ${var.docker_username} --password-stdin"
+  ]
+
+    connection {
+      type        = "ssh"
+      user        = "root"
+      private_key = file(var.ssh_private_key_path)
+      host        = hcloud_server.app_server.ipv4_address
+    }
+  }
 
   # Generate docker-compose.yml on remote server
   provisioner "file" {
@@ -108,7 +126,7 @@ resource "null_resource" "docker_compose" {
     connection {
       type        = "ssh"
       user        = "root"
-      private_key = file("~/.ssh/id_rsa")
+      private_key = file(var.ssh_private_key_path)
       host        = hcloud_server.app_server.ipv4_address
     }
   }
@@ -127,16 +145,17 @@ resource "null_resource" "docker_compose" {
     connection {
       type        = "ssh"
       user        = "root"
-      private_key = file("~/.ssh/id_rsa")
+      private_key = file(var.ssh_private_key_path)
       host        = hcloud_server.app_server.ipv4_address
     }
   }
 
   # Deploy the application
-  provisioner "remote-exec" {
+ provisioner "remote-exec" {
     inline = [
       "cd /app",
       "docker-compose down || true",
+      "echo ${var.docker_password} | docker login -u ${var.docker_username} --password-stdin",
       "docker-compose pull",
       "docker-compose up -d"
     ]
@@ -144,41 +163,33 @@ resource "null_resource" "docker_compose" {
     connection {
       type        = "ssh"
       user        = "root"
-      private_key = file("~/.ssh/id_rsa")
+      private_key = file(var.ssh_private_key_path)
       host        = hcloud_server.app_server.ipv4_address
     }
   }
 }
 
-# Add backup setup
+# Add backup setup - triggers only when backup configuration changes
 resource "null_resource" "setup_backups" {
-  depends_on = [null_resource.docker_compose]
+  depends_on = [null_resource.deployment]
+
+  triggers = {
+    backup_script_hash = sha256(file("${path.module}/templates/backup.sh.tpl"))
+  }
 
   # Copy backup script
   provisioner "file" {
-    content = <<-EOT
-      #!/bin/bash
-      TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-      BACKUP_DIR="/app/backups"
-      
-      # Create backup directory if it doesn't exist
-      mkdir -p $BACKUP_DIR
-      
-      # Backup the database
-      docker exec fisioapp-postgres pg_dump -U ${var.db_user} -d ${var.db_name} > $BACKUP_DIR/fisioapp_$TIMESTAMP.sql
-      
-      # Compress the backup
-      gzip $BACKUP_DIR/fisioapp_$TIMESTAMP.sql
-      
-      # Keep only the 7 most recent backups
-      ls -t $BACKUP_DIR/*.gz | tail -n +8 | xargs rm -f
-    EOT
+    content = templatefile("${path.module}/templates/backup.sh.tpl", {
+      db_user = var.db_user
+      db_name = var.db_name
+      backups_to_keep = var.backups_to_keep
+    })
     destination = "/app/backup.sh"
 
     connection {
       type        = "ssh"
       user        = "root"
-      private_key = file("~/.ssh/id_rsa")
+      private_key = file(var.ssh_private_key_path)
       host        = hcloud_server.app_server.ipv4_address
     }
   }
@@ -188,13 +199,13 @@ resource "null_resource" "setup_backups" {
     inline = [
       "chmod +x /app/backup.sh",
       "mkdir -p /app/backups",
-      "crontab -l 2>/dev/null | { cat; echo \"0 3 * * * /app/backup.sh\"; } | crontab -"
+      "(crontab -l 2>/dev/null | grep -v '/app/backup.sh' || true; echo \"0 3 * * * /app/backup.sh\") | crontab -"
     ]
 
     connection {
       type        = "ssh"
       user        = "root"
-      private_key = file("~/.ssh/id_rsa")
+      private_key = file(var.ssh_private_key_path)
       host        = hcloud_server.app_server.ipv4_address
     }
   }

@@ -7,7 +7,13 @@ variable "hcloud_token" {
 variable "server_location" {
   description = "Location for the server (nbg1, fsn1, hel1, ash)"
   type        = string
-  default     = "hel1"  # Nuremberg as default - lower latency for European users
+  default     = "hel1"  # Helsinki as default
+}
+
+variable "ssh_private_key_path" {
+  description = "Path to the SSH private key file"
+  type        = string
+  default     = "~/.ssh/id_rsa"
 }
 
 variable "db_user" {
@@ -48,6 +54,30 @@ variable "backend_image_tag" {
 
 variable "jwt_secret" {
   description = "JWT Secret for authentication"
+  type        = string
+  sensitive   = true
+}
+
+variable "deployment_version" {
+  description = "Version tag to trigger redeployment"
+  type        = string
+  default     = "1.0.0"
+}
+
+variable "backups_to_keep" {
+  description = "Number of database backups to retain"
+  type        = number
+  default     = 7
+}
+
+variable "docker_username" {
+  description = "Docker Hub username"
+  type        = string
+  default     = "franarnaudo"
+}
+
+variable "docker_password" {
+  description = "Docker Hub password"
   type        = string
   sensitive   = true
 }
