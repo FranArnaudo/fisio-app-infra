@@ -1,0 +1,8 @@
+POSTGRES_HOST=${db_host}
+POSTGRES_PORT=5432
+POSTGRES_USER=${db_user}
+POSTGRES_PASSWORD=${db_password}
+POSTGRES_DB=${db_name}
+JWT_SECRET=${jwt_secret}
+PORT=3000
+NODE_ENV=production

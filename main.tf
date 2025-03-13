@@ -1,3 +1,4 @@
+# Define required providers
 terraform {
   required_providers {
     hcloud = {
@@ -7,105 +8,194 @@ terraform {
   }
 }
 
+# Configure the Hetzner Cloud Provider
 provider "hcloud" {
   token = var.hcloud_token
 }
 
-# Register SSH key
+# Create a new SSH key
 resource "hcloud_ssh_key" "default" {
-  name       = "my-ssh-key"
-  public_key = file("C:/Users/FranA/.ssh/id_ed25519.pub")
+  name       = "FisioApp Deployment Key"
+  public_key = file("~/.ssh/id_rsa.pub")
 }
 
-# Create a Hetzner volume to persist database data
-resource "hcloud_volume" "db_volume" {
-  name      = "db-volume"
-  size      = 50                # Adjust size (in GB) as needed.
-  server_id = hcloud_server.app.id
-  format    = "ext4"
-}
-
-# Create the consolidated server with a user_data script
-resource "hcloud_server" "app" {
-  name        = "consolidated-app"
-  server_type = "cx22"
+# Create a server
+resource "hcloud_server" "app_server" {
+  name        = "fisioapp-server"
   image       = "ubuntu-20.04"
+  server_type = "cx21"  # 4GB RAM, 2 vCPU - adjust as needed
+  location    = var.server_location
   ssh_keys    = [hcloud_ssh_key.default.id]
-  user_data   = <<-EOF
-                #!/bin/bash
-                apt-get update -y
-                apt-get install -y docker.io docker-compose git
+  
+  # Ensure firewall allows needed ports
+  firewall_ids = [hcloud_firewall.app_firewall.id]
 
-                # Create mount point for the database volume and mount it
-                mkdir -p /mnt/db_volume
-                mount /dev/disk/by-id/scsi-0HC_Volume_db-volume /mnt/db_volume
+  # Additional volume for database persistence
+  connection {
+    type        = "ssh"
+    user        = "root"
+    private_key = file("~/.ssh/id_rsa")
+    host        = self.ipv4_address
+  }
 
-                # Log in to DockerHub (replace with your credentials as needed)
-                docker login -u franarnaudo -p DFran24/11/99R
-
-                # Fetch the public IP address from Hetzner metadata
-
-                # Write the docker-compose.yml file
-                cat << EOD > /root/docker-compose.yml
-                version: '3'
-                services:
-                  frontend:
-                    image: franarnaudo/fisio-app:fisio-app-fe-0.0.4
-                    ports:
-                      - "80:80"
-                    restart: always
-
-                  backend:
-                    image: franarnaudo/fisio-app:fisio-app-be-0.0.4
-                    ports:
-                      - "8080:3000"
-                    environment:
-                      - POSTGRES_HOST=database
-                      - POSTGRES_PORT=5432
-                      - POSTGRES_USER=postgres
-                      - POSTGRES_PASSWORD=Fran24
-                      - POSTGRES_DB=fisio-app
-                    restart: always
-
-                  database:
-                    image: postgres:13
-                    environment:
-                      POSTGRES_USER: postgres
-                      POSTGRES_PASSWORD: Fran24
-                      POSTGRES_DB: fisio-app
-                    volumes:
-                      - db-data:/var/lib/postgresql/data
-                    restart: always
-
-                volumes:
-                  db-data:
-                    driver: local
-                    driver_opts:
-                      type: none
-                      o: bind
-                      device: /mnt/db_volume
-                EOD
-
-                # Start containers using Docker Compose
-                docker-compose -f /root/docker-compose.yml up -d
-                EOF
+  # Initial server setup
+  provisioner "remote-exec" {
+    inline = [
+      "apt update",
+      "apt install -y docker.io docker-compose",
+      "systemctl enable docker",
+      "systemctl start docker",
+      "mkdir -p /app/data",
+      "docker volume create postgres_data"
+    ]
+  }
 }
 
-# Firewall rules for the server (exposing only frontend and backend ports)
+# Create a firewall for the server
 resource "hcloud_firewall" "app_firewall" {
   name = "app-firewall"
 
+  # Allow SSH
+  rule {
+    direction  = "in"
+    protocol   = "tcp"
+    port       = "22"
+    source_ips = ["0.0.0.0/0", "::/0"]
+  }
+
+  # Allow HTTP
   rule {
     direction  = "in"
     protocol   = "tcp"
     port       = "80"
-    source_ips = ["0.0.0.0/0"]
+    source_ips = ["0.0.0.0/0", "::/0"]
   }
 
+  # Allow HTTPS
   rule {
     direction  = "in"
     protocol   = "tcp"
-    port       = "8080"
-    source_ips = ["0.0.0.0/0"]
+    port       = "443"
+    source_ips = ["0.0.0.0/0", "::/0"]
+  }
+  
+  # Allow PostgreSQL external access
+  rule {
+    direction  = "in"
+    protocol   = "tcp"
+    port       = "5432"
+    source_ips = ["0.0.0.0/0", "::/0"]  # Consider restricting this to specific IPs
+  }
+}
+
+# Create the docker-compose.yml file
+resource "null_resource" "docker_compose" {
+  depends_on = [hcloud_server.app_server]
+
+  # Generate docker-compose.yml on remote server
+  provisioner "file" {
+    content = templatefile("${path.module}/templates/docker-compose.yml.tpl", {
+      docker_image_repo = var.docker_image_repo
+      frontend_image_tag = var.frontend_image_tag
+      backend_image_tag = var.backend_image_tag
+      db_user = var.db_user
+      db_password = var.db_password
+      db_name = var.db_name
+      api_url = "http://${hcloud_server.app_server.ipv4_address}:3000"
+    })
+    destination = "/app/docker-compose.yml"
+
+    connection {
+      type        = "ssh"
+      user        = "root"
+      private_key = file("~/.ssh/id_rsa")
+      host        = hcloud_server.app_server.ipv4_address
+    }
+  }
+
+  # Generate environment files
+  provisioner "file" {
+    content = templatefile("${path.module}/templates/backend.env.tpl", {
+      db_host     = "postgres"  # Service name in docker-compose
+      db_user     = var.db_user
+      db_password = var.db_password
+      db_name     = var.db_name
+      jwt_secret  = var.jwt_secret
+    })
+    destination = "/app/backend.env"
+
+    connection {
+      type        = "ssh"
+      user        = "root"
+      private_key = file("~/.ssh/id_rsa")
+      host        = hcloud_server.app_server.ipv4_address
+    }
+  }
+
+  # Deploy the application
+  provisioner "remote-exec" {
+    inline = [
+      "cd /app",
+      "docker-compose down || true",
+      "docker-compose pull",
+      "docker-compose up -d"
+    ]
+
+    connection {
+      type        = "ssh"
+      user        = "root"
+      private_key = file("~/.ssh/id_rsa")
+      host        = hcloud_server.app_server.ipv4_address
+    }
+  }
+}
+
+# Add backup setup
+resource "null_resource" "setup_backups" {
+  depends_on = [null_resource.docker_compose]
+
+  # Copy backup script
+  provisioner "file" {
+    content = <<-EOT
+      #!/bin/bash
+      TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+      BACKUP_DIR="/app/backups"
+      
+      # Create backup directory if it doesn't exist
+      mkdir -p $BACKUP_DIR
+      
+      # Backup the database
+      docker exec fisioapp-postgres pg_dump -U ${var.db_user} -d ${var.db_name} > $BACKUP_DIR/fisioapp_$TIMESTAMP.sql
+      
+      # Compress the backup
+      gzip $BACKUP_DIR/fisioapp_$TIMESTAMP.sql
+      
+      # Keep only the 7 most recent backups
+      ls -t $BACKUP_DIR/*.gz | tail -n +8 | xargs rm -f
+    EOT
+    destination = "/app/backup.sh"
+
+    connection {
+      type        = "ssh"
+      user        = "root"
+      private_key = file("~/.ssh/id_rsa")
+      host        = hcloud_server.app_server.ipv4_address
+    }
+  }
+
+  # Make backup script executable and set up cron job
+  provisioner "remote-exec" {
+    inline = [
+      "chmod +x /app/backup.sh",
+      "mkdir -p /app/backups",
+      "crontab -l 2>/dev/null | { cat; echo \"0 3 * * * /app/backup.sh\"; } | crontab -"
+    ]
+
+    connection {
+      type        = "ssh"
+      user        = "root"
+      private_key = file("~/.ssh/id_rsa")
+      host        = hcloud_server.app_server.ipv4_address
+    }
   }
 }
